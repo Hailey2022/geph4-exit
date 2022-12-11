@@ -84,5 +84,5 @@ async-recursion = "1.0.0"
 [profile.release]
 panic = "abort"
 opt-level=3
-debug=2
+# debug=2
 # lto=false
