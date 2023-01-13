@@ -1,6 +1,6 @@
 [package]
 name = "geph4-exit"
-version = "0.5.0"
+version = "0.7.0"
 authors = ["nullchinchilla <nullchinchilla@pm.me>", "Geph Project <contact@geph.io"]
 edition = "2018"
 description="Exit node for Geph"
@@ -53,7 +53,7 @@ rustc-hash= "1.1.0"
 futures-util= "0.3.24"
 
 geph4-aioutils = "0.1.3"
-geph4-protocol = "0.11"
+geph4-protocol = "0.12"
 # geph4-protocol={path="../geph4-protocol"}
 mizaru = "0.1.3"
 tun= "0.5.4"
@@ -76,10 +76,15 @@ sysinfo = "0.26.5"
 
 mimalloc = { version = "0.1.30", default-features=false}
 stdcode = "0.1.13"
-sosistab2 = "0.3"
+sosistab2 = "0.6"
 nanorpc = "0.1.12"
 closure = "0.3.0"
 async-recursion = "1.0.0"
+arrayref = "0.3.6"
+native-tls = "0.2.11"
+rcgen = "0.10.0"
+priority-async-mutex = "0.1.1"
+atomic_float = "0.1.0"
 
 [profile.release]
 panic = "abort"

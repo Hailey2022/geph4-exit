@@ -7,7 +7,13 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{asn::MY_PUBLIC_IP, config::Config, ratelimit::STAT_LIMITER, vpn};
+use crate::{
+    asn::MY_PUBLIC_IP,
+    config::Config,
+    ratelimit::{RateLimiter, STAT_LIMITER},
+    vpn,
+};
+use atomic_float::AtomicF64;
 use bytes::Bytes;
 use ed25519_dalek::{ed25519::signature::Signature, Signer};
 use event_listener::Event;
@@ -21,11 +27,12 @@ use geph4_protocol::{
     bridge_exit::serve_bridge_exit,
 };
 
-use smol::{channel::Sender, fs::unix::PermissionsExt, prelude::*};
+use moka::sync::Cache;
+use smol::{channel::Sender, fs::unix::PermissionsExt, prelude::*, Task};
 
 use sosistab::Session;
 use sosistab2::{MuxSecret, ObfsUdpListener, ObfsUdpSecret};
-use sysinfo::{System, SystemExt};
+use sysinfo::{CpuExt, System, SystemExt};
 use x25519_dalek::StaticSecret;
 
 use self::{control::ControlService, session_v2::handle_pipe_v2};
@@ -57,7 +64,15 @@ pub struct RootCtx {
     pub sess_replacers: DashMap<[u8; 32], Sender<Session>>,
     pub kill_event: Event,
 
+    pub load_factor: Arc<AtomicF64>,
+
+    mass_ratelimits: Cache<u64, RateLimiter>,
+
     stat_count: AtomicU64,
+
+    parent_ratelimit: RateLimiter,
+
+    _task: Task<()>,
 }
 
 impl From<Config> for RootCtx {
@@ -117,6 +132,8 @@ impl From<Config> for RootCtx {
         };
         log::info!("signing_sk = {}", hex::encode(signing_sk.public));
         let sosistab_sk = x25519_dalek::StaticSecret::from(*signing_sk.secret.as_bytes());
+        let parent_ratelimit = RateLimiter::new(*cfg.all_limit(), *cfg.all_limit(), None);
+        let load_factor = Arc::new(AtomicF64::new(0.0));
         Self {
             config: cfg.clone(),
             stat_client: cfg.official().as_ref().map(|official| {
@@ -139,6 +156,8 @@ impl From<Config> for RootCtx {
             sosistab_sk,
             sosistab2_sk,
 
+            load_factor: load_factor.clone(),
+
             session_count: Default::default(),
             raw_session_count: Default::default(),
             conn_count: Default::default(),
@@ -147,6 +166,62 @@ impl From<Config> for RootCtx {
             sess_replacers: Default::default(),
             kill_event: Event::new(),
             stat_count: AtomicU64::new(0),
+
+            mass_ratelimits: Cache::builder()
+                .time_to_idle(Duration::from_secs(86400))
+                .build(),
+
+            parent_ratelimit: parent_ratelimit.clone(),
+            _task: smolscale::spawn(set_ratelimit_loop(
+                load_factor,
+                cfg.nat_external_iface()
+                    .clone()
+                    .unwrap_or_else(|| String::from("lo")),
+                parent_ratelimit,
+            )),
+        }
+    }
+}
+
+async fn set_ratelimit_loop(
+    load_factor: Arc<AtomicF64>,
+    iface_name: String,
+    parent_ratelimit: RateLimiter,
+) {
+    let mut sys = System::new_all();
+    let mut i = 0.0;
+    let target_usage = 0.9f32;
+    let mut divider;
+    let mut timer = smol::Timer::interval(Duration::from_secs(1));
+    let mut last_bw_used = 0u128;
+    loop {
+        timer.next().await;
+        sys.refresh_all();
+        let cpus = sys.cpus();
+        let cpu_usage = cpus.iter().map(|c| c.cpu_usage() / 100.0).sum::<f32>() / cpus.len() as f32;
+        let bw_used: u128 = String::from_utf8_lossy(
+            &std::fs::read(format!("/sys/class/net/{iface_name}/statistics/tx_bytes")).unwrap(),
+        )
+        .trim()
+        .parse()
+        .unwrap();
+        let bw_delta = bw_used.saturating_sub(last_bw_used);
+        last_bw_used = bw_used;
+        let bw_usage = (bw_delta as f64 / 1000.0 / parent_ratelimit.limit() as f64) as f32;
+        let total_usage = bw_usage.max(cpu_usage);
+        load_factor.store(total_usage as f64, Ordering::Relaxed);
+        if total_usage < target_usage * 0.8 {
+            i = 0.0;
+            parent_ratelimit.set_divider(1.0);
+        } else {
+            log::info!("CPU PID usage: {:.2}%", cpu_usage * 100.0);
+            log::info!("B/W PID usage: {:.2}%", bw_usage * 100.0);
+            let p = total_usage - target_usage;
+            i += p;
+            i = i.clamp(-20.0, 20.0);
+            divider = 1.0 + (1.0 * p + 0.4 * i).min(100.0);
+            log::info!("PID divider {divider}, p {p}, i {i}");
+            parent_ratelimit.set_divider(divider as f64);
         }
     }
 }
@@ -178,6 +253,25 @@ impl RootCtx {
             .as_ref()
             .map(|official| official.exit_hostname().to_owned())
             .unwrap_or_default()
+    }
+
+    pub fn get_ratelimit(&self, key: u64, free: bool) -> RateLimiter {
+        let limit = *self.config.all_limit();
+        if free {
+            self.mass_ratelimits.get_with(key, || {
+                RateLimiter::new(
+                    self.config
+                        .official()
+                        .as_ref()
+                        .and_then(|s| *s.free_limit())
+                        .unwrap_or_default(),
+                    32,
+                    self.parent_ratelimit.clone().into(),
+                )
+            })
+        } else {
+            RateLimiter::unlimited(self.parent_ratelimit.clone().into())
+        }
     }
 
     fn new_sess(self: &Arc<Self>, sess: sosistab::Session) -> SessCtx {
@@ -324,7 +418,8 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                     .bridge_secret()
                     .as_bytes(),
             );
-            let socket = smol::net::UdpSocket::bind("0.0.0.0:28080").await?;
+            let socket = smol::net::UdpSocket::bind("0.0.0.0:28080").await.unwrap();
+            log::info!("starting bridge exit listener");
             serve_bridge_exit(
                 socket,
                 *secret.as_bytes(),
@@ -333,6 +428,7 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
             .await?;
             Ok(())
         } else {
+            log::info!("NOT starting bridge exit listener");
             smol::future::pending().await
         }
     };
@@ -349,20 +445,9 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
     let self_bridge_fut = async {
         let flow_key = bridge_pkt_key("SELF");
         let listen_addr: SocketAddr = ctx.config.sosistab_listen().parse().unwrap();
-        log::info!(
-            "listening on {}@{}:{}",
-            hex::encode(x25519_dalek::PublicKey::from(&ctx.sosistab_sk).to_bytes()),
-            if listen_addr.ip().is_unspecified() {
-                IpAddr::from(*MY_PUBLIC_IP)
-            } else {
-                listen_addr.ip()
-            },
-            listen_addr.port()
-        );
+
         let udp_listen = ctx.listen_udp(None, listen_addr, &flow_key).await.unwrap();
         let tcp_listen = ctx.listen_tcp(None, listen_addr, &flow_key).await.unwrap();
-        log::debug!("sosis_listener initialized");
-
         loop {
             let sess = udp_listen
                 .accept_session()
@@ -383,11 +468,16 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
         let ctrlkey = format!("control_count.{}", exit_hostname.replace('.', "-"));
         let taskkey = format!("task_count.{}", exit_hostname.replace('.', "-"));
         let hijackkey = format!("hijackers.{}", exit_hostname.replace('.', "-"));
+        let cpukey = format!("cpu_usage.{}", exit_hostname.replace('.', "-"));
         let mut sys = System::new_all();
 
         loop {
             sys.refresh_all();
+
             if let Some(stat_client) = ctx.stat_client.as_ref() {
+                let cpus = sys.cpus();
+                let usage = cpus.iter().map(|c| c.cpu_usage()).sum::<f32>() / cpus.len() as f32;
+
                 let session_count = ctx.session_count.load(std::sync::atomic::Ordering::Relaxed);
                 stat_client.gauge(&key, session_count as f64);
                 let raw_session_count = ctx
@@ -405,6 +495,7 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                 stat_client.gauge(&taskkey, task_count as f64);
                 stat_client.gauge(&threadkey, thread_count as f64);
                 stat_client.gauge(&hijackkey, ctx.sess_replacers.len() as f64);
+                stat_client.gauge(&cpukey, usage as f64);
             }
             smol::Timer::after(Duration::from_secs(10)).await;
         }
@@ -421,6 +512,7 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                 .sosistab2_listen()
                 .parse()
                 .expect("cannot parse sosistab2 listening address");
+
             let listener = ObfsUdpListener::bind(listen_addr, secret.clone()).unwrap();
             // Upload a "self-bridge". sosistab2 bridges have the key field be the bincode-encoded pair of bridge key and e2e key
             let mut _task = None;
@@ -469,6 +561,20 @@ pub async fn main_loop(ctx: Arc<RootCtx>) -> anyhow::Result<()> {
                 }));
             }
             // we now enter the usual feeding loop
+            log::info!(
+                "listening on {}@{}:{}",
+                hex::encode(
+                    ObfsUdpSecret::from_bytes(ctx.sosistab2_sk.to_bytes())
+                        .to_public()
+                        .as_bytes()
+                ),
+                if listen_addr.ip().is_unspecified() {
+                    IpAddr::from(*MY_PUBLIC_IP)
+                } else {
+                    listen_addr.ip()
+                },
+                listen_addr.port()
+            );
             loop {
                 let pipe = listener.accept().await?;
                 handle_pipe_v2(ctx.clone(), pipe);

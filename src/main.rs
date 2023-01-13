@@ -128,6 +128,7 @@ export INTERFACE={}
 
 iptables --flush
 iptables -t nat -F
+iptables -t mangle -F
 
 {}
 {}
